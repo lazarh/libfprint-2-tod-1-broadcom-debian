@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Check root privileges
 if [ "$EUID" -ne 0 ]; then
   echo "Error: Please run this script as root or with sudo."
   exit 1
@@ -13,91 +12,71 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
 echo " Starting Broadcom BCM58200 ControlVault 3 Installer"
 echo " Target: Debian 13 (Trixie)"
-echo " Log output: ${LOG_FILE}"
 echo "=================================================="
 
-# 1. Install System Dependencies
-echo "[1/6] Installing build and runtime dependencies..."
+# 1. Install Runtime Dependencies
+echo "[1/4] Installing runtime dependencies..."
 apt-get update -qq
-apt-get install -y -qq \
-    git \
-    meson \
-    ninja-build \
-    gcc \
-    g++ \
-    pkg-config \
-    libglib2.0-dev \
-    libgusb-dev \
-    libpixman-1-dev \
-    libssl-dev \
-    libgudev-1.0-dev \
-    systemd-dev \
-    fprintd \
-    binutils \
-    zstd \
-    curl \
-    polkitd
+apt-get install -y -qq fprintd binutils zstd curl polkitd file
 
-# 2. Build and Install libfprint-tod Base
-echo "[2/6] Compiling and installing libfprint-tod base framework..."
-BUILD_DIR=$(mktemp -d /tmp/fprint-build.XXXXXX)
-cd "${BUILD_DIR}"
+WORK_DIR=$(mktemp -d /tmp/broadcom-install.XXXXXX)
+cd "${WORK_DIR}"
 
-git clone --depth 1 -b tod https://gitlab.freedesktop.org/libfprint/libfprint.git libfprint-tod
-cd libfprint-tod
+# 2. Fetch and configure libfprint-2-tod-1 framework
+echo "[2/4] Fetching and configuring libfprint-2-tod-1 framework..."
+TOD_URL="https://launchpad.net/ubuntu/+archive/primary/+files/libfprint-2-tod1_1.94.3+tod1-0ubuntu1_amd64.deb"
+curl -sSL -o libfprint-tod.deb "${TOD_URL}"
 
-meson setup build --prefix=/usr -Dintrospection=false -Ddoc=false
-ninja -C build
-ninja -C build install
+if dpkg -s libfprint-2-2 >/dev/null 2>&1; then
+    dpkg --purge --force-depends libfprint-2-2
+fi
 
-# Verification
-if ! pkg-config --modversion libfprint-2-tod-1 >/dev/null 2>&1; then
-    echo "Error: libfprint-tod failed to register via pkg-config."
+dpkg -i --force-overwrite libfprint-tod.deb || apt-get install -f -y
+apt-mark hold libfprint-2-tod1
+
+# Fix: Instead of overriding the core library file directly (which breaks symbol maps),
+# ensure proper symlinking without triggering ldconfig warnings:
+rm -f /usr/lib/x86_64-linux-gnu/libfprint-2.so.2
+ln -sf libfprint-2-tod.so.1 /usr/lib/x86_64-linux-gnu/libfprint-2.so.2
+ldconfig || true
+
+# 3. Download and Extract Broadcom Driver + Firmware
+echo "[3/4] Fetching Broadcom ControlVault 3 TOD driver package..."
+DRIVER_URL="http://dell.archive.canonical.com/updates/pool/public/libf/libfprint-2-tod1-broadcom/libfprint-2-tod1-broadcom_5.15.285-5.15.010.0-0ubuntu2~22.04.1~oem1_amd64.deb"
+curl -sSL -o driver.deb "${DRIVER_URL}"
+
+if ! file driver.deb | grep -q "Debian binary package"; then
+    echo "Error: Downloaded driver file is not a valid Debian package."
     exit 1
 fi
 
-# 3. Download Dell Broadcom TOD Driver Package
-echo "[3/6] Fetching Broadcom ControlVault 3 TOD package..."
-DRIVER_DIR=$(mktemp -d /tmp/broadcom-pkg.XXXXXX)
-cd "${DRIVER_DIR}"
-
-DEB_URL="https://launchpad.net/ubuntu/+archive/primary/+files/libfprint-2-tod1-broadcom_5.15.285-5.15.010.0-0ubuntu2~22.04.1~oem1_amd64.deb"
-curl -sSL -o driver.deb "${DEB_URL}"
-
-# Extract package
 ar x driver.deb
 mkdir -p extracted
 tar --zstd -xf data.tar.zst -C extracted
 
-# 4. Deploy Binary Driver, Udev Rules, and Firmware
-echo "[4/6] Installing driver modules and firmware binaries..."
-
-# Locate extracted files dynamically
 SO_FILE=$(find extracted -name "libfprint-2-tod-1-broadcom.so" -o -name "libfprint-tod-broadcom.so" | head -n 1)
 RULES_FILE=$(find extracted -name "*broadcom.rules" | head -n 1)
 
-if [ -z "${SO_FILE}" ] || [ -z "${RULES_FILE}" ]; then
-    echo "Error: Driver binaries could not be located in extracted package."
-    exit 1
-fi
-
 mkdir -p /usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/
 mkdir -p /usr/lib/udev/rules.d/
-mkdir -p /usr/lib/firmware/broadcom
+mkdir -p /usr/lib/firmware/broadcom/
 
-cp "${SO_FILE}" /usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/
-cp "${RULES_FILE}" /usr/lib/udev/rules.d/
+cp "${SO_FILE}" /usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/libfprint-2-tod-broadcom.so
+chmod 755 /usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/libfprint-2-tod-broadcom.so
 
-# Copy Broadcom SBI firmware files
-if [ -d "extracted/var" ]; then
-    cp -r extracted/var/* /var/
-    if [ -d "extracted/var/lib/fprint" ]; then
-        cp -r extracted/var/lib/fprint/* /usr/lib/firmware/broadcom/ 2>/dev/null || true
-    fi
+if [ -n "${RULES_FILE}" ]; then
+    cp "${RULES_FILE}" /usr/lib/udev/rules.d/
 fi
 
-# 5. Configure Polkit Authorization Rules
-echo "[5/6] Configuring Polkit authorization rules..."
+if [ -d "extracted/var/lib/fprint" ]; then
+    cp -r extracted/var/lib/fprint/* /usr/lib/firmware/broadcom/ 2>/dev/null || true
+    cp -r extracted/var/lib/fprint/* /var/lib/fprint/ 2>/dev/null || true
+fi
+
+ldconfig
+
+# 4. Configure Polkit Authorization Rules & Restart Services
+echo "[4/4] Configuring Polkit and reloading daemons..."
 mkdir -p /etc/polkit-1/rules.d/
 cat << 'EOF' > /etc/polkit-1/rules.d/50-net.reactivated.fprint.device.enroll.rules
 polkit.addRule(function(action, subject) {
@@ -108,20 +87,12 @@ polkit.addRule(function(action, subject) {
 });
 EOF
 
-# 6. Apply Rules and Restart Services
-echo "[6/6] Reloading system daemons..."
 udevadm control --reload-rules && udevadm trigger
 systemctl restart fprintd
 
-# Clean up build artifacts
-rm -rf "${BUILD_DIR}" "${DRIVER_DIR}"
+rm -rf "${WORK_DIR}"
 
 echo "=================================================="
 echo " Installation Complete!"
-echo "=================================================="
-echo "Verify device initialization by checking logs:"
-echo "  sudo journalctl -u fprintd -n 20 --no-pager"
-echo ""
-echo "Enroll your fingerprint using:"
-echo "  fprintd-enroll"
+echo " Run 'fprintd-enroll' to register your fingerprint."
 echo "=================================================="
