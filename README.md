@@ -66,7 +66,7 @@ Ensure your user account belongs to the sudo group:
 sudo usermod -aG sudo $USER
 ```
 Re-log into your shell session to refresh group memberships.
+
 ##📄 License
 The shell scripts in this repository are licensed under the MIT License. Broadcom firmware binaries and proprietary driver modules downloaded during installation belong to their respective copyright holders.
 
-# libfprint-2-tod-1-broadcom-debian
